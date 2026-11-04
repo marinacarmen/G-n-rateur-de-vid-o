@@ -1,0 +1,9 @@
+streamlit
+anthropic
+replicate
+edge-tts
+moviepy>=2.0
+imageio-ffmpeg
+pillow
+numpy
+mcp>=1.10
