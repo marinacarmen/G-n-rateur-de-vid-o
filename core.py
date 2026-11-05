@@ -4,6 +4,8 @@ Utilisé à la fois par l'interface web (app.py) et par le serveur MCP (mcp_serv
 """
 import asyncio
 import json
+import os
+import random
 import re
 import subprocess
 import tempfile
@@ -14,6 +16,14 @@ from pathlib import Path
 # ----------------------------- CONFIG ---------------------------------
 CLAUDE_MODEL = "claude-sonnet-5-5"
 I2V_MODEL = "wan-video/wan-2.2-i2v-fast"  # image -> clip ; vérifie le nom et les champs sur replicate.com
+
+# Mode test gratuit : IMAGE_BACKEND=pollinations (images gratuites, sans clé) et LOW_RES=1 (petite résolution, peu de mémoire)
+# Sans clé Replicate, on bascule automatiquement en mode test gratuit.
+IMAGE_BACKEND = (os.environ.get("IMAGE_BACKEND")
+                 or ("replicate" if os.environ.get("REPLICATE_API_TOKEN") else "pollinations")).lower()
+_lr = os.environ.get("LOW_RES")
+LOW_RES = (_lr == "1") if _lr is not None else (IMAGE_BACKEND == "pollinations")
+print(f"[core] image_backend={IMAGE_BACKEND} low_res={LOW_RES}", flush=True)
 
 IMAGE_MODELS = {
     "schnell": "black-forest-labs/flux-schnell",  # rapide, bon marché
@@ -40,10 +50,17 @@ LANGS = {  # nom : (voix edge-tts, nom de la langue pour Claude)
     "Italiano": ("it-IT-ElsaNeural", "Italian"),
 }
 
-FORMATS = {  # nom : (largeur, hauteur, ratio Flux)
-    "16:9": (1280, 720, "16:9"),
-    "9:16": (720, 1280, "9:16"),
-}
+if LOW_RES:
+    FORMATS = {  # nom : (largeur, hauteur, ratio Flux)
+        "16:9": (640, 360, "16:9"),
+        "9:16": (360, 640, "9:16"),
+    }
+else:
+    FORMATS = {
+        "16:9": (1280, 720, "16:9"),
+        "9:16": (720, 1280, "9:16"),
+    }
+POLLI_SIZES = {"16:9": (1024, 576), "9:16": (576, 1024)}
 
 FONT_CANDIDATES = [
     "arialbd.ttf", "Arial Bold.ttf",
@@ -125,12 +142,14 @@ Scènes :
 # ----------------------------- COÛTS ----------------------------------
 def estimate(n_scenes: int, formats: list[str], image_quality: str = "schnell", use_animation: bool = False) -> dict:
     n_img = n_scenes * len(formats)
+    price = 0.0 if IMAGE_BACKEND == "pollinations" else APPROX_USD_PER_IMAGE[image_quality]
     out = {
         "scenes": n_scenes,
         "formats": formats,
         "voix_off": n_scenes,
         "images": n_img,
-        "cout_images_usd_approx": round(n_img * APPROX_USD_PER_IMAGE[image_quality], 2),
+        "cout_images_usd_approx": round(n_img * price, 2),
+        "mode": "test gratuit (Pollinations)" if IMAGE_BACKEND == "pollinations" else "Replicate",
         "animations_ia": n_img if use_animation else 0,
         "note": "Prix indicatifs, à vérifier sur Replicate. Les animations IA coûtent bien plus cher que les images.",
     }
@@ -138,18 +157,38 @@ def estimate(n_scenes: int, formats: list[str], image_quality: str = "schnell", 
 
 
 # ----------------------------- IMAGES / CLIPS --------------------------
+def _gen_pollinations(prompt: str, ratio: str, path: str):
+    """Images gratuites sans clé (service Pollinations). Qualité et disponibilité variables."""
+    import urllib.parse
+    import urllib.request
+    w, h = POLLI_SIZES[ratio]
+    url = (f"https://image.pollinations.ai/prompt/{urllib.parse.quote(prompt[:800])}"
+           f"?width={w}&height={h}&model=flux&nologo=true&seed={random.randint(1, 10**6)}")
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (video-maker)"})
+    with urllib.request.urlopen(req, timeout=180) as r:
+        data = r.read()
+        ctype = r.headers.get("Content-Type", "")
+    if not ctype.startswith("image/") or len(data) < 2000:
+        raise RuntimeError(f"Réponse inattendue du service d'images ({ctype}, {len(data)} octets)")
+    Path(path).write_bytes(data)
+
+
 def gen_image(prompt: str, ratio: str, path: str, model: str):
-    import replicate
     last = None
-    for attempt in range(3):
+    free = IMAGE_BACKEND == "pollinations"
+    for attempt in range(4 if free else 3):
         try:
-            out = replicate.run(model, input={"prompt": prompt, "aspect_ratio": ratio,
-                                              "num_outputs": 1, "output_format": "png"})
-            Path(path).write_bytes(out[0].read())
+            if free:
+                _gen_pollinations(prompt, ratio, path)
+            else:
+                import replicate
+                out = replicate.run(model, input={"prompt": prompt, "aspect_ratio": ratio,
+                                                  "num_outputs": 1, "output_format": "png"})
+                Path(path).write_bytes(out[0].read())
             return
         except Exception as e:  # limites de débit, erreurs réseau...
             last = e
-            time.sleep(4 * (attempt + 1))
+            time.sleep(5 * (attempt + 1))
     raise last
 
 
@@ -178,7 +217,10 @@ def get_font(size):
             return ImageFont.truetype(f, size)
         except OSError:
             continue
-    return ImageFont.load_default()
+    try:  # Pillow récent : police intégrée redimensionnable (aucune police système nécessaire)
+        return ImageFont.load_default(size)
+    except TypeError:
+        return ImageFont.load_default()
 
 
 def subtitle_array(text, W, H):
@@ -290,7 +332,7 @@ def produce_video(scenes, character, style, lang, formats, image_quality="schnel
         W, H, ratio = FORMATS[fmt]
         tag = fmt.replace(":", "x")
         imgs = [str(work / f"i{i}_{tag}.png") for i in range(n)]
-        with ThreadPoolExecutor(max_workers=3) as ex:
+        with ThreadPoolExecutor(max_workers=1 if IMAGE_BACKEND == "pollinations" else 3) as ex:
             jobs = [ex.submit(gen_image,
                               f"{character}. {sc['image_prompt']}. {STYLES[style]}. {NO_TEXT}",
                               ratio, imgs[i], model)
