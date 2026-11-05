@@ -6,4 +6,4 @@ moviepy>=2.0
 imageio-ffmpeg
 pillow
 numpy
-mcp>=1.10
+mcp>=1.10,<2
